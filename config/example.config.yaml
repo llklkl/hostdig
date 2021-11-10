@@ -1,0 +1,7 @@
+dns_list:
+  - type: file
+    path: /path/to/your/dns/list/file
+  - type: remote
+    path: example.com/dnslist.txt
+hosts:
+  - path: /path/to/your/hosts
