@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -74,6 +75,26 @@ func doHttpGet(path string, data []byte, timeout time.Duration) ([]byte, int, er
 	return respData, resp.StatusCode, nil
 }
 
+func readDnsServersFromData(reader *bufio.Reader) []string {
+	dnsServers := make([]string, 0)
+	for {
+		line, err := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		if err != nil {
+			if err == io.EOF {
+				dnsServers = append(dnsServers, line)
+			}
+			break
+		}
+		dnsServers = append(dnsServers, line)
+	}
+
+	return dnsServers
+}
+
 func fetchDnsServersFromRemote(address string) ([]string, error) {
 	data, _, err := doHttpGet(address, nil, 10*time.Second)
 	if err != nil {
@@ -81,21 +102,7 @@ func fetchDnsServersFromRemote(address string) ([]string, error) {
 	}
 
 	reader := bufio.NewReader(bytes.NewReader(data))
-	dnsServers := make([]string, 0)
-	for {
-		line, err := reader.ReadString('\n')
-		line = strings.TrimSpace(line)
-		if err != nil {
-			if err == io.EOF {
-				dnsServers = append(dnsServers, line)
-				break
-			}
-			continue
-		}
-		dnsServers = append(dnsServers, line)
-	}
-
-	return dnsServers, nil
+	return readDnsServersFromData(reader), nil
 }
 
 func fetchDnsServersFromFile(filename string) ([]string, error) {
@@ -105,19 +112,7 @@ func fetchDnsServersFromFile(filename string) ([]string, error) {
 	}
 
 	reader := bufio.NewReader(fp)
-	dnsServers := make([]string, 0)
-	for {
-		line, err := reader.ReadString('\n')
-		line = strings.TrimSpace(line)
-		if err == io.EOF {
-			dnsServers = append(dnsServers, line)
-			break
-		}
-
-		dnsServers = append(dnsServers, line)
-	}
-
-	return dnsServers, nil
+	return readDnsServersFromData(reader), nil
 }
 
 func getDnsList(list []config.DnsListEntry) []string {
@@ -179,7 +174,7 @@ func concurrentDnsResolve(dnsServers []string, host string) ([]string, error) {
 	mx := sync.Mutex{}
 
 	wg := sync.WaitGroup{}
-	ch := make(chan struct{}, 16)
+	ch := make(chan struct{}, runtime.GOMAXPROCS(0)*2)
 	for _, dnsAddress := range dnsServers {
 		wg.Add(1)
 		ch <- struct{}{}
@@ -289,12 +284,18 @@ func concurrentTestLatency(host string, ips []string) (string, error) {
 
 	wg := sync.WaitGroup{}
 	ch := make(chan testResult, 1)
-	con := make(chan struct{}, 16)
+	con := make(chan struct{}, runtime.GOMAXPROCS(0)*2)
 	for _, ip := range ips {
 		wg.Add(1)
 		con <- struct{}{}
 		go func(ip string) {
-			latency, err := doTestHttpLatency(host, ip, 4*time.Second)
+			var latency time.Duration
+			var err error
+			if testType == "http" {
+				latency, err = doTestHttpLatency(host, ip, 4*time.Second)
+			} else {
+				latency, err = doTestTcpLatency(ip, 4*time.Second)
+			}
 			if err == nil {
 				ch <- testResult{
 					Ip:      ip,
@@ -322,19 +323,25 @@ func concurrentTestLatency(host string, ips []string) (string, error) {
 	close(ch)
 	close(con)
 
-	if minLatency == time.Hour {
+	if minLatency == time.Hour && !quiet {
 		return "", fmt.Errorf("cannot connect to those ips[%v]", ips)
 	}
 
 	return fastIp, nil
 }
 
-func hostdig(cfg *config.Config) string {
-	builder := strings.Builder{}
+func fmtAsString(builder *strings.Builder) func(string, string) {
+	return func(host string, ip string) {
+		builder.WriteString(ip)
+		builder.WriteString(" ")
+		builder.WriteString(host)
+		builder.WriteString("\n")
+	}
+}
 
+func hostdig(cfg *config.Config, formater func(string, string)) {
 	dnsServers := getDnsList(cfg.DnsList)
 
-	now := time.Now().Format(time.RFC3339)
 	for _, hs := range cfg.HostsCfg {
 		filepath.Walk(hs.Path, func(path string, info fs.FileInfo, err error) error {
 			if err != nil {
@@ -349,12 +356,6 @@ func hostdig(cfg *config.Config) string {
 					return nil // continue
 				}
 
-				// write header
-				if builder.Len() > 0 {
-					builder.WriteString("\n")
-				}
-				builder.WriteString(fmt.Sprintf("# %s update at %s\n", filepath.Base(path), now))
-
 				for _, h := range hosts {
 					ips, err := concurrentDnsResolve(dnsServers, h)
 					if err != nil {
@@ -368,15 +369,13 @@ func hostdig(cfg *config.Config) string {
 						continue
 					}
 
-					builder.WriteString(fmt.Sprintf("%s %s\n", fastip, h))
+					formater(h, fastip)
 				}
 			}
 
 			return nil
 		})
 	}
-
-	return builder.String()
 }
 
 func startServe(cmd *cobra.Command, listenOn string, period int64) {
@@ -397,9 +396,11 @@ func startServe(cmd *cobra.Command, listenOn string, period int64) {
 	http.HandleFunc("/refresh", func(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			mx.Lock()
-			cache = hostdig(cfg)
+			builder := strings.Builder{}
+			hostdig(cfg, fmtAsString(&builder))
+			cache = builder.String()
 			cached = true
-			defer mx.Unlock()
+			mx.Unlock()
 		}()
 
 		_, _ = w.Write([]byte("ok"))
@@ -427,7 +428,9 @@ loop:
 		select {
 		case <-timer.C:
 			mx.Lock()
-			cache = hostdig(cfg)
+			builder := strings.Builder{}
+			hostdig(cfg, fmtAsString(&builder))
+			cache = builder.String()
 			cached = true
 			mx.Unlock()
 
@@ -442,18 +445,26 @@ loop:
 	close(exit)
 	close(sigs)
 
-	cmd.Println("bye!")
+	if !quiet {
+		cmd.Println("bye!")
+	}
+}
+
+func writeFile(fp *os.File, buf string) error {
+	offset := 0
+	for offset < len(buf) {
+		n, err := fp.WriteString(buf[offset:])
+		if err != nil {
+			return fmt.Errorf("error occurred while write to file[%s],err: %s\n", output, err.Error())
+		}
+
+		offset += n
+	}
+
+	return fp.Sync()
 }
 
 func writeResult(cmd *cobra.Command, output string) error {
-	if !quiet {
-		cmd.Println("start dig hosts...")
-	}
-	hosts := hostdig(cfg)
-	if !quiet {
-		cmd.Println("done")
-	}
-
 	var fp *os.File
 	var err error
 	if len(output) > 0 {
@@ -465,29 +476,138 @@ func writeResult(cmd *cobra.Command, output string) error {
 		cmd.PrintErrln("cannot open the specified file, err:", err.Error())
 		return err
 	}
+	defer fp.Close()
 
-	if len(output) > 0 {
-		if !quiet {
-			cmd.Printf("hosts has written to file[%s]", output)
-		}
-	} else {
-		if !quiet {
-			cmd.Println("hosts:\n")
-		}
+	if !quiet {
+		cmd.Println("start dig hosts...")
+	}
+	builder := strings.Builder{}
+	hostdig(cfg, fmtAsString(&builder))
+	hosts := builder.String()
+	if !quiet {
+		cmd.Println("done")
 	}
 
-	offset := 0
-	for offset < len(hosts) {
-		n, err := fp.WriteString(hosts[offset:])
-		if err != nil {
-			cmd.PrintErrf("error occurred while write to file[%s],err: %s\n", output, err.Error())
-			break
-		}
+	if len(output) == 0 && !quiet {
+		cmd.Println("hosts:")
+		return nil
+	}
 
-		offset += n
+	if err := writeFile(fp, hosts); err != nil {
+		cmd.PrintErrln(err)
+	}
+	if len(output) > 0 && !quiet {
+		cmd.Printf("hosts has written to file[%s]", output)
 	}
 
 	return nil
+}
+
+func replaceResult(cmd *cobra.Command, output string) error {
+	hostMap := make(map[string]string)
+	hostdig(cfg, func(host string, ip string) {
+		hostMap[host] = ip
+	})
+
+	fp, err := os.OpenFile(output, os.O_RDWR|os.O_CREATE, 0755)
+	if err != nil {
+		cmd.PrintErrln("cannot open the specified file, err:", err.Error())
+		return err
+	}
+	defer fp.Close()
+
+	needAppend := make(map[string]string, len(hostMap))
+	for k, v := range hostMap {
+		needAppend[k] = v
+	}
+	builder := strings.Builder{}
+	reader := bufio.NewReader(fp)
+	stop := false
+	whiteLine := 0
+	for !stop {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				stop = true
+			} else {
+				break
+			}
+		}
+
+		pos := strings.IndexByte(line, '#')
+		if pos == -1 {
+			pos = len(line)
+		}
+
+		strs := strings.Split(strings.TrimSpace(line[:pos]), " ")
+		if len(strs) <= 1 {
+			if len(strings.TrimSpace(line)) == 0 { //white line
+				whiteLine++
+			} else {
+				whiteLine = 0
+			}
+			if whiteLine < 2 {
+				builder.WriteString(line)
+			}
+			continue
+		}
+		whiteLine = 0
+
+		exist := map[string]struct{}{}
+		flag := false // anyone exists, remain this line
+		for i := 1; i < len(strs); i++ {
+			if len(strs[i]) == 0 {
+				continue
+			}
+			if ip, e := hostMap[strs[i]]; e && ip != strs[0] {
+				exist[strs[i]] = struct{}{}
+			} else {
+				flag = true
+				delete(needAppend, strs[i])
+			}
+		}
+
+		if len(exist) == 0 {
+			builder.WriteString(line)
+		} else if flag {
+			builder.WriteString(strs[0])
+			builder.WriteString(" ")
+			for i := 1; i < len(strs); i++ {
+				if len(strs[i]) == 0 { // space
+					continue
+				}
+				if _, e := exist[strs[i]]; !e {
+					builder.WriteString(strs[i])
+					builder.WriteString(" ")
+				}
+			}
+
+			builder.WriteString(line[pos:])
+			if pos != len(line) {
+				builder.WriteString("\n")
+			}
+		}
+	}
+
+	builder.WriteString("\n")
+	for host, ip := range needAppend {
+		builder.WriteString(ip)
+		builder.WriteString(" ")
+		builder.WriteString(host)
+		builder.WriteString("\n")
+	}
+
+	if _, err := fp.Seek(0, 0); err != nil {
+		cmd.PrintErrf("error occurred while write to file[%s],err: %s\n", output, err.Error())
+		return err
+	} else {
+		if err := fp.Truncate(0); err != nil {
+			cmd.PrintErrf("error occurred while write to file[%s],err: %s\n", output, err.Error())
+			return err
+		}
+	}
+
+	return writeFile(fp, builder.String())
 }
 
 func loadConfig(filename string) error {
@@ -509,11 +629,13 @@ var (
 )
 
 var (
-	cfgPath string // path to config file
-	output  string // output file, default stdout
-	listen  string // deploy a server and listen on this addr
-	period  int64  // refresh period
-	quiet   bool
+	testType string // type of testing latency, default is http
+	cfgPath  string // path to config file
+	output   string // output file, default stdout
+	replace  bool   // replace output file
+	listen   string // deploy a server and listen on this addr
+	period   int64  // refresh period
+	quiet    bool
 )
 
 func init() {
@@ -521,18 +643,24 @@ func init() {
 	hc = &http.Client{}
 
 	cobra.OnInitialize(func() {
+		if rootCmd.Flags().NFlag() == 0 {
+			rootCmd.Usage()
+			os.Exit(0)
+		}
 		if err := loadConfig(cfgPath); err != nil {
 			rootCmd.PrintErrln("failed to read config file, err:", err.Error())
-			os.Exit(-1)
+			os.Exit(1)
 		}
 	})
 
 	rootCmd.Flags().SortFlags = false
-	rootCmd.PersistentFlags().StringVarP(&cfgPath, "config", "c", "./config.yaml", "config file (default is ./config.yaml)")
+	rootCmd.Flags().StringVarP(&cfgPath, "config", "c", "", "config file path")
+	rootCmd.Flags().StringVarP(&testType, "type", "t", "tcp", "the type of testing latency, support tcp or http, default is tcp")
 	rootCmd.Flags().StringVarP(&output, "output", "o", "", "output file (default is stdout)")
+	rootCmd.Flags().BoolVarP(&replace, "replace", "r", false, "replace the ip in the specified output file")
 	rootCmd.Flags().StringVarP(&listen, "listen", "l", "", "start a server and listen on this address, example: --listen=:8080")
 	rootCmd.Flags().Int64VarP(&period, "period", "", 24*3600, "set the refresh period in seconds, only if the listen option was set")
-	rootCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "no print hint msg")
+	rootCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "not print log info")
 }
 
 func Run(cmd *cobra.Command, args []string) {
@@ -542,7 +670,9 @@ func Run(cmd *cobra.Command, args []string) {
 
 	if len(listen) != 0 {
 		startServe(cmd, listen, period)
+	} else if !replace || len(output) == 0 {
+		cobra.CheckErr(writeResult(cmd, output))
+	} else {
+		cobra.CheckErr(replaceResult(cmd, output))
 	}
-
-	cobra.CheckErr(writeResult(cmd, output))
 }
