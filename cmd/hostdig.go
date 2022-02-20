@@ -228,7 +228,9 @@ func loadHosts(filename string) ([]string, error) {
 }
 
 func doTestTcpLatency(host, ip string, timeout time.Duration) (time.Duration, error) {
-	fmt.Printf("test %s %s\n", host, ip)
+	if !quiet {
+		fmt.Printf("test %s %s\n", host, ip)
+	}
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:80", ip), timeout)
 	if err != nil {
@@ -240,7 +242,9 @@ func doTestTcpLatency(host, ip string, timeout time.Duration) (time.Duration, er
 }
 
 func doTestHttpLatency(host, ip string, timeout time.Duration) (time.Duration, error) {
-	fmt.Printf("test %s %s\n", host, ip)
+	if !quiet {
+		fmt.Printf("test %s %s\n", host, ip)
+	}
 	ld := localdns.New()
 	ld.Update(host, ip)
 
