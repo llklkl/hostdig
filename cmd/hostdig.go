@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -174,7 +173,7 @@ func concurrentDnsResolve(dnsServers []string, host string) ([]string, error) {
 	mx := sync.Mutex{}
 
 	wg := sync.WaitGroup{}
-	ch := make(chan struct{}, runtime.GOMAXPROCS(0)*2)
+	ch := make(chan struct{}, 16)
 	for _, dnsAddress := range dnsServers {
 		wg.Add(1)
 		ch <- struct{}{}
@@ -191,8 +190,8 @@ func concurrentDnsResolve(dnsServers []string, host string) ([]string, error) {
 				mx.Unlock()
 			}
 
-			wg.Done()
 			<-ch
+			wg.Done()
 		}(dnsAddress)
 	}
 
@@ -212,23 +211,24 @@ func loadHosts(filename string) ([]string, error) {
 	reader := bufio.NewReader(fp)
 	for {
 		line, err := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
 		if err != nil {
 			if err == io.EOF {
-				line = strings.TrimSpace(line)
 				res = append(res, line)
 				break
 			}
 			continue
 		}
-
-		line = strings.TrimSpace(line)
-		res = append(res, line)
+		if len(line) > 0 {
+			res = append(res, line)
+		}
 	}
 
 	return res, nil
 }
 
-func doTestTcpLatency(ip string, timeout time.Duration) (time.Duration, error) {
+func doTestTcpLatency(host, ip string, timeout time.Duration) (time.Duration, error) {
+	fmt.Printf("test %s %s\n", host, ip)
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:80", ip), timeout)
 	if err != nil {
@@ -240,6 +240,7 @@ func doTestTcpLatency(ip string, timeout time.Duration) (time.Duration, error) {
 }
 
 func doTestHttpLatency(host, ip string, timeout time.Duration) (time.Duration, error) {
+	fmt.Printf("test %s %s\n", host, ip)
 	ld := localdns.New()
 	ld.Update(host, ip)
 
@@ -284,7 +285,7 @@ func concurrentTestLatency(host string, ips []string) (string, error) {
 
 	wg := sync.WaitGroup{}
 	ch := make(chan testResult, 1)
-	con := make(chan struct{}, runtime.GOMAXPROCS(0)*2)
+	con := make(chan struct{}, 16)
 	for _, ip := range ips {
 		wg.Add(1)
 		con <- struct{}{}
@@ -294,7 +295,7 @@ func concurrentTestLatency(host string, ips []string) (string, error) {
 			if testType == "http" {
 				latency, err = doTestHttpLatency(host, ip, 4*time.Second)
 			} else {
-				latency, err = doTestTcpLatency(ip, 4*time.Second)
+				latency, err = doTestTcpLatency(host, ip, 4*time.Second)
 			}
 			if err == nil {
 				ch <- testResult{
@@ -303,8 +304,8 @@ func concurrentTestLatency(host string, ips []string) (string, error) {
 				}
 			}
 
-			wg.Done()
 			<-con
+			wg.Done()
 		}(ip)
 	}
 
@@ -363,10 +364,21 @@ func hostdig(cfg *config.Config, formater func(string, string)) {
 						continue
 					}
 
+					if !quiet {
+						fmt.Printf("dig host %s, ip=%v\n", h, ips)
+						fmt.Println("testing latency")
+					}
+
 					fastip, err := concurrentTestLatency(h, ips)
 					if err != nil {
-						log.Printf("unexpected error occurred while test latency for host[%s], err=%s", h, err.Error())
+						if !quiet {
+							fmt.Println("all timeout")
+						}
 						continue
+					}
+
+					if !quiet {
+						fmt.Printf("the fastest ip is %s\n", fastip)
 					}
 
 					formater(h, fastip)
@@ -490,7 +502,6 @@ func writeResult(cmd *cobra.Command, output string) error {
 
 	if len(output) == 0 && !quiet {
 		cmd.Println("hosts:")
-		return nil
 	}
 
 	if err := writeFile(fp, hosts); err != nil {
