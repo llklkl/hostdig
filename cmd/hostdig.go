@@ -287,8 +287,11 @@ func concurrentTestLatency(host string, ips []string) (string, error) {
 		Latency time.Duration
 	}
 
+	var fastIp string
+	var minLatency = time.Hour
+	var mx sync.Mutex
+
 	wg := sync.WaitGroup{}
-	ch := make(chan testResult, 1)
 	con := make(chan struct{}, 16)
 	for _, ip := range ips {
 		wg.Add(1)
@@ -302,10 +305,12 @@ func concurrentTestLatency(host string, ips []string) (string, error) {
 				latency, err = doTestTcpLatency(host, ip, 4*time.Second)
 			}
 			if err == nil {
-				ch <- testResult{
-					Ip:      ip,
-					Latency: latency,
+				mx.Lock()
+				if latency < minLatency {
+					minLatency = latency
+					fastIp = ip
 				}
+				mx.Unlock()
 			}
 
 			<-con
@@ -313,19 +318,7 @@ func concurrentTestLatency(host string, ips []string) (string, error) {
 		}(ip)
 	}
 
-	var fastIp string
-	var minLatency = time.Hour
-	go func() {
-		for r := range ch {
-			if r.Latency < minLatency {
-				minLatency = r.Latency
-				fastIp = r.Ip
-			}
-		}
-	}()
-
 	wg.Wait()
-	close(ch)
 	close(con)
 
 	if minLatency == time.Hour && !quiet {
