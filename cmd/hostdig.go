@@ -79,16 +79,12 @@ func readDnsServersFromData(reader *bufio.Reader) []string {
 	for {
 		line, err := reader.ReadString('\n')
 		line = strings.TrimSpace(line)
-		if len(line) == 0 {
-			continue
+		if len(line) > 0 {
+			dnsServers = append(dnsServers, line)
 		}
 		if err != nil {
-			if err == io.EOF {
-				dnsServers = append(dnsServers, line)
-			}
 			break
 		}
-		dnsServers = append(dnsServers, line)
 	}
 
 	return dnsServers
@@ -212,15 +208,11 @@ func loadHosts(filename string) ([]string, error) {
 	for {
 		line, err := reader.ReadString('\n')
 		line = strings.TrimSpace(line)
-		if err != nil {
-			if err == io.EOF {
-				res = append(res, line)
-				break
-			}
-			continue
-		}
 		if len(line) > 0 {
 			res = append(res, line)
+		}
+		if err != nil {
+			break
 		}
 	}
 
@@ -346,38 +338,40 @@ func hostdig(cfg *config.Config, formater func(string, string)) {
 				log.Printf("read host file failed, err=%s", err.Error())
 				return nil
 			}
+			if info.IsDir() {
+				return nil
+			}
 
-			if !info.IsDir() {
-				hosts, err := loadHosts(path)
+			hosts, err := loadHosts(path)
+			if err != nil {
+				log.Printf("unexpected error occurred while load hosts from file, err=%s", err.Error())
+				return nil // continue
+			}
+
+			for _, h := range hosts {
+				ips, err := concurrentDnsResolve(dnsServers, h)
 				if err != nil {
-					log.Printf("unexpected error occurred while load hosts from file, err=%s", err.Error())
-					return nil // continue
+					log.Printf("unexpected error occurred while resolve host[%s], err=%s", h, err.Error())
+					continue
 				}
 
-				for _, h := range hosts {
-					ips, err := concurrentDnsResolve(dnsServers, h)
-					if err != nil {
-						log.Printf("unexpected error occurred while resolve host[%s], err=%s", h, err.Error())
-						continue
-					}
+				if !quiet {
+					fmt.Printf("dig host %s, ip=%v\n", h, ips)
+					fmt.Println("testing latency")
+				}
 
+				fastip, err := concurrentTestLatency(h, ips)
+				if err != nil {
 					if !quiet {
-						fmt.Printf("dig host %s, ip=%v\n", h, ips)
-						fmt.Println("testing latency")
+						fmt.Println("all timeout")
 					}
+					continue
+				}
 
-					fastip, err := concurrentTestLatency(h, ips)
-					if err != nil {
-						if !quiet {
-							fmt.Println("all timeout")
-						}
-						continue
-					}
-
+				if len(fastip) > 0 {
 					if !quiet {
 						fmt.Printf("the fastest ip is %s\n", fastip)
 					}
-
 					formater(h, fastip)
 				}
 			}
