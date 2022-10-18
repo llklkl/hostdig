@@ -398,9 +398,9 @@ func startServe(cmd *cobra.Command, listenOn string, period int64) {
 
 	http.HandleFunc("/refresh", func(w http.ResponseWriter, r *http.Request) {
 		go func() {
-			mx.Lock()
 			builder := strings.Builder{}
 			hostdig(cfg, fmtAsString(&builder))
+			mx.Lock()
 			cache = builder.String()
 			cached = true
 			mx.Unlock()
@@ -430,9 +430,9 @@ loop:
 	for {
 		select {
 		case <-timer.C:
-			mx.Lock()
 			builder := strings.Builder{}
 			hostdig(cfg, fmtAsString(&builder))
+			mx.Lock()
 			cache = builder.String()
 			cached = true
 			mx.Unlock()
